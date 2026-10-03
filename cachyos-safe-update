@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# actualizar — comprueba que hay espacio de sobra antes de actualizar (repositorios + AUR)
+# Uso:   actualizar          actualiza si hay espacio suficiente
+#        actualizar --check  solo muestra el cálculo (la limpieza de caché sí se ejecuta)
+set -euo pipefail
+
+FACTOR=2          # se exige 2× lo estimado: initramfs, snapshots snapper, coexistencia de versiones...
+MIN_LIBRE_GB=10   # mínimo absoluto aunque la actualización sea pequeña
+AUR_RESERVA_GB=2  # presupuesto por paquete AUR pendiente (su tamaño es desconocido)
+
+hr() { numfmt --to=iec --suffix=B "$1"; }
+GB=$((1024 * 1024 * 1024))
+
+if [[ $EUID -eq 0 ]]; then
+    echo "No lo ejecutes como root: ya usa sudo internamente (y paru se niega a correr como root)." >&2
+    exit 1
+fi
+
+# limpiar cachés ANTES de medir: lo liberado cuenta para la comprobación
+echo "→ Limpiando cachés"
+sudo paccache -rk1   # deja 1 versión de cada paquete instalado
+sudo paccache -ruk0  # borra las de paquetes ya desinstalados
+# staging de descargas que dejó una transacción interrumpida (alpm:700):
+# sin esto el downloader sandbox de pacman 7 falla con "Error reading fd N"
+sudo rm -rf /var/cache/pacman/pkg/download-*
+if command -v paru >/dev/null; then
+    paru -Sc --noconfirm
+fi
+
+# /var/cache, /usr, /home y /boot viven todos en el mismo btrfs → basta mirar /
+libres=$(df -B1 --output=avail / | tail -1)
+
+if ! sudo pacman -Sy --quiet; then   # refresca las bases de datos para saber qué hay pendiente
+    echo "✗ No se pudieron descargar las bases de datos (¿red caída?). Reintenta." >&2
+    exit 1
+fi
+
+mapfile -t repo < <(pacman -Quq 2>/dev/null || true)
+mapfile -t aur < <(command -v paru >/dev/null && paru -Qua -q 2>/dev/null || true)
+
+if ((${#repo[@]} == 0 && ${#aur[@]} == 0)); then
+    echo "Nada que actualizar."
+    exit 0
+fi
+
+dl=$(pacman -Su --print-format '%s' 2>/dev/null | awk '{s+=$1} END {printf "%d", s+0}')
+inst=0
+if ((${#repo[@]} > 0)); then
+    # sin este if, pacman -Si sin argumentos lista TODOS los paquetes del repo
+    inst=$(LC_ALL=C pacman -Si -- "${repo[@]}" 2>/dev/null \
+        | awk '/^Installed Size/ {u=$5; v=$4; s+=v*(u=="KiB"?1024:u=="MiB"?1048576:u=="GiB"?1073741824:1)} END {printf "%d", s+0}')
+fi
+
+exigir=$(( (dl + inst) * FACTOR + ${#aur[@]} * AUR_RESERVA_GB * GB ))
+if ((exigir < MIN_LIBRE_GB * GB)); then
+    exigir=$((MIN_LIBRE_GB * GB))
+fi
+
+echo "Pendientes: ${#repo[@]} de repositorio, ${#aur[@]} de AUR"
+echo "Descarga: $(hr "$dl") · Instalado: $(hr "$inst") · Libres: $(hr "$libres") · Se exigen: $(hr "$exigir")"
+
+if ((libres < exigir)); then
+    echo "✗ Espacio insuficiente. Libera algo y reintenta:" >&2
+    echo "    sudo paccache -rk1             deja 1 sola versión en caché de pacman" >&2
+    echo "    paru -Sc                       caché de builds AUR" >&2
+    echo "    journalctl --vacuum-size=200M  recorta el journal" >&2
+    echo "    snapper -c root delete N       borra snapshots viejos (ver antes: snapper list)" >&2
+    exit 1
+fi
+
+if [[ ${1:-} == --check ]]; then
+    echo "(--check: no se actualiza nada)"
+    exit 0
+fi
+
+if ((${#repo[@]} > 0)); then
+    sudo pacman -Su
+fi
+if ((${#aur[@]} > 0)); then
+    paru -Su --aur
+fi
+echo "Hecho. Libres ahora: $(hr "$(df -B1 --output=avail / | tail -1)")"
